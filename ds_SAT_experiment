@@ -1,0 +1,305 @@
+#GCN
+#ステップ1：ライブラリのインストール（Colab）
+# PyTorch Geometric に必要な依存パッケージをインストール
+!pip install -q torch-scatter -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
+!pip install -q torch-sparse -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
+!pip install -q torch-geometric
+
+#ステップ2：MUTAGデータセットの読み込み
+from torch_geometric.datasets import TUDataset
+
+# データの読み込み（自動的にダウンロード）
+dataset = TUDataset(root='data/TUDataset', name='MUTAG')
+
+# データの基本情報を確認
+print(f'グラフ数: {len(dataset)}')
+print(f'ノード特徴数: {dataset.num_node_features}')
+print(f'分類ラベル数: {dataset.num_classes}')
+print(dataset[0])  # 最初のグラフの内容を表示
+
+import pandas as pd
+from torch_geometric.utils import to_networkx
+
+# 表示したい数
+num_graphs = 10
+
+# データを保存するリスト
+data_list = []
+
+for i in range(num_graphs):
+    g = dataset[i]
+    graph = to_networkx(g)
+
+    info = {
+        'Index': i,
+        'ノード数': g.num_nodes,
+        'エッジ数': g.num_edges,
+        '特徴次元': g.x.shape[1] if g.x is not None else 0,
+        'ラベル': int(g.y),
+    }
+    data_list.append(info)
+
+# DataFrameに変換して表示
+df = pd.DataFrame(data_list)
+display(df)
+
+#ステップ3：GCNモデルの構築
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, global_mean_pool
+from torch_geometric.loader import DataLoader
+
+class GCN(torch.nn.Module):
+    def __init__(self, hidden_channels):
+        super().__init__()
+        self.conv1 = GCNConv(dataset.num_node_features, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        self.lin = torch.nn.Linear(hidden_channels, dataset.num_classes)
+
+    def forward(self, x, edge_index, batch):
+        x = self.conv1(x, edge_index).relu()
+        x = self.conv2(x, edge_index).relu()
+        x = global_mean_pool(x, batch)
+        return self.lin(x)
+
+#ステップ4：データの分割とトレーニング関数
+from sklearn.model_selection import train_test_split
+
+# データをシャッフルして分割
+torch.manual_seed(42)
+train_dataset, test_dataset = train_test_split(dataset, test_size=0.2)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32)
+
+# モデルと最適化
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = GCN(hidden_channels=64).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# トレーニング関数
+def train():
+    model.train()
+    total_loss = 0
+    for batch in train_loader:
+        batch = batch.to(device)
+        optimizer.zero_grad()
+        out = model(batch.x, batch.edge_index, batch.batch)
+        loss = F.cross_entropy(out, batch.y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(train_loader)
+
+# テスト関数
+def test(loader):
+    model.eval()
+    correct = 0
+    for batch in loader:
+        batch = batch.to(device)
+        out = model(batch.x, batch.edge_index, batch.batch)
+        pred = out.argmax(dim=1)
+        correct += (pred == batch.y).sum().item()
+    return correct / len(loader.dataset)
+
+#ステップ5：学習の実行
+gcn_train_acc_list = []
+gcn_test_acc_list = []
+
+for epoch in range(1, 51):
+    loss = train()
+    train_acc = test(train_loader)
+    test_acc = test(test_loader)
+    gcn_train_acc_list.append(train_acc * 100)
+    gcn_test_acc_list.append(test_acc * 100)
+    print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}, Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}')
+
+#SAT
+#ステップ1：SATモデルの構築
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SimpleMultiHeadAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+        self.qkv_proj = nn.Linear(embed_dim, embed_dim * 3)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x):
+        B, N, C = x.size()
+        qkv = self.qkv_proj(x)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1,2)
+        k = k.transpose(1,2)
+        v = v.transpose(1,2)
+
+        attn = (q @ k.transpose(-2,-1)) / (self.head_dim ** 0.5)
+        attn = attn.softmax(dim=-1)
+        out = attn @ v
+        out = out.transpose(1,2).reshape(B, N, C)
+        out = self.out_proj(out)
+        return out
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = SimpleMultiHeadAttention(embed_dim, num_heads)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, int(embed_dim*mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(embed_dim*mlp_ratio), embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class SATTransformerModel(nn.Module):
+    def __init__(self, in_channels, embed_dim, num_classes, num_heads=4, num_layers=2):
+        super().__init__()
+        self.embedding = nn.Linear(in_channels, embed_dim)
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads) for _ in range(num_layers)
+        ])
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+    def forward(self, data):
+        x = data.x
+        batch = data.batch
+        x = self.embedding(x)
+
+        batch_size = batch.max().item() + 1
+        max_nodes = (batch.bincount()).max().item()
+
+        x_padded = torch.zeros(batch_size, max_nodes, x.size(1), device=x.device)
+        mask = torch.zeros(batch_size, max_nodes, dtype=torch.bool, device=x.device)
+        for i in range(batch_size):
+            idx = (batch == i).nonzero(as_tuple=True)[0]
+            length = idx.size(0)
+            x_padded[i, :length] = x[idx]
+            mask[i, :length] = 1
+
+        for block in self.transformer_blocks:
+            x_padded = block(x_padded)
+
+        x_pooled = x_padded.mean(dim=1)
+
+        out = self.classifier(x_pooled)
+        return out
+
+#ステップ2：データセットの読み込み
+from torch_geometric.datasets import TUDataset
+from torch_geometric.loader import DataLoader
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+dataset = TUDataset(root='./data', name='MUTAG')
+print(f"Number of classes in dataset: {dataset.num_classes}")
+dataset = dataset.shuffle()
+train_dataset = dataset[:int(len(dataset)*0.8)]
+test_dataset = dataset[int(len(dataset)*0.8):]
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+def check_labels(data):
+    labels = data.y
+    if (labels < 0).any():
+        raise ValueError(f"Negative label found: {labels}")
+    if (labels >= dataset.num_classes).any():
+        raise ValueError(f"Label out of range found: {labels}")
+
+#ステップ3：学習関数の設定
+model = SATTransformerModel(
+    in_channels=dataset.num_node_features,
+    embed_dim=128,
+    num_heads=4,
+    num_classes=dataset.num_classes,
+    num_layers=3
+).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.CrossEntropyLoss()
+
+def train():
+    model.train()
+    total_loss = 0
+    for batch_idx, data in enumerate(train_loader):
+        data = data.to(device)
+        try:
+            check_labels(data)
+        except ValueError as e:
+            print(f"Label error in batch {batch_idx}: {e}")
+            continue
+
+        optimizer.zero_grad()
+        out = model(data)
+        loss = criterion(out, data.y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * data.num_graphs
+    return total_loss / len(train_loader.dataset)
+
+def test(train=False):
+    model.eval()
+    correct = 0
+    total = 0
+    loader = train_loader if train else test_loader
+    with torch.no_grad():
+        for data in loader:
+            data = data.to(device)
+            out = model(data)
+            pred = out.argmax(dim=1)
+            correct += (pred == data.y).sum().item()
+            total += data.num_graphs
+    return correct / total
+
+#ステップ4：学習の実行
+sat_train_acc_list = []
+sat_test_acc_list = []
+
+for epoch in range(1, 51):
+    loss = train()
+    train_acc = test(train=True)
+    test_acc = test(train=False)
+    sat_train_acc_list.append(train_acc * 100)
+    sat_test_acc_list.append(test_acc * 100)
+    print(f"Epoch: {epoch:03d}, Loss: {loss:.4f}, Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}")
+
+#結果の可視化
+import matplotlib.pyplot as plt
+
+epochs = list(range(1, 51))
+
+plt.figure(figsize=(10, 6))
+plt.plot(epochs, gcn_train_acc_list, label='GCN Train Accuracy', marker='o')
+plt.plot(epochs, sat_train_acc_list, label='SAT Train Accuracy', marker='s')
+plt.xlabel('Epoch')
+plt.ylabel('Train Accuracy (%)')
+plt.title('GCN vs SAT Train Accuracy over Epochs')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(10, 6))
+plt.plot(epochs, gcn_test_acc_list, label='GCN Test Accuracy', marker='o')
+plt.plot(epochs, sat_test_acc_list, label='SAT Test Accuracy', marker='s')
+plt.xlabel('Epoch')
+plt.ylabel('Test Accuracy (%)')
+plt.title('GCN vs SAT Test Accuracy per Epoch')
+plt.legend()
+plt.grid(True)
+plt.show()
